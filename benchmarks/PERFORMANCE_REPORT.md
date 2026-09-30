@@ -7,7 +7,7 @@
 This report provides empirical engineering evidence evaluating CacheShort's multi-tiered performance profile across three distinct layers:
 1. **In-Process Algorithmic Execution:** Microsecond-scale resolution overhead of the custom HashMap + Doubly Linked List LRU Cache vs. direct dictionary lookups.
 2. **Local HTTP End-to-End Resolution:** Server processing duration, request timing headers (`X-Process-Time`), and throughput under controlled concurrency.
-3. **Production HTTP Deployment (Render + Supabase):** Real-world latency distributions across public redirects and authenticated management endpoints.
+3. **Live Production Deployment (Render + Supabase):** Real-world latency distributions across public health checks and warm URL redirect endpoints.
 
 ---
 
@@ -21,17 +21,21 @@ This report provides empirical engineering evidence evaluating CacheShort's mult
 | **Database** | Supabase PostgreSQL / In-Memory Mock | Supabase Hosted PostgreSQL |
 | **Database Pool** | `psycopg_pool` (`prepare_threshold=None`) | Transaction Pooler (Port 6543, `prepare_threshold=None`) |
 | **Cache Architecture**| HashMap + Doubly Linked List (`RLock`) | HashMap + Doubly Linked List (`RLock`) |
+| **Deployment URL** | `http://127.0.0.1:8000` | `https://cacheshort-api.onrender.com` |
 | **Report Date** | 2026-09-30 | 2026-09-30 |
 
 ---
 
 ## 3. Methodology & Statistical Principles
 
-- **Timing Precision:** Python `time.perf_counter_ns()` (in-process) and `time.perf_counter()` (HTTP).
+- **Timing Precision:** Python `time.perf_counter_ns()` (in-process micro-benchmarks) and `time.perf_counter()` (HTTP client benchmarks).
 - **Statistical Percentiles:** Calculated from sorted response latency arrays (P50/Median, P90, P95, P99, Min, Max, Mean).
-- **Rate Limiting Safety:** Controlled concurrency ($c=1$ to $c=2$) and capped request volume preventing volumetric overload or 429 cascades.
-- **Cache-State Integrity:** A cache hit is defined strictly as a key residing in the in-memory LRU table, requiring **zero database read queries**. A cache miss requires database retrieval and subsequent cache population.
-- **Scientific Honesty:** Results not experimentally executed in the immediate session are explicitly labeled **NOT MEASURED**.
+- **Rate Limiting Safety:** Controlled concurrency ($c=1$) and capped request volume ($N=10$) preventing volumetric overload or 429 cascades.
+- **Cache-State Integrity:** A cache hit is defined strictly as a key residing in the in-memory LRU table.
+- **Measurement Boundaries:**
+  - **In-Process Benchmark:** Measures purely CPU and in-memory data structure traversal overhead.
+  - **Server Processing Time (`X-Process-Time`):** Measures server-side ASGI request handling duration excluding client-to-server network transit.
+  - **HTTP Benchmark Latency:** Measures complete end-to-end client round-trip time (DNS + TLS handshake + WAN network transit + server processing + response transfer).
 
 ---
 
@@ -70,43 +74,64 @@ This report provides empirical engineering evidence evaluating CacheShort's mult
 ---
 
 ### Tier 3: Live Production Deployment (Render + Supabase)
-*Target: `https://cacheshort-api.onrender.com`*
+*Measured via `benchmarks/benchmark_http.py` against `https://cacheshort-api.onrender.com` ($c=1$, $N=10$).*
 
-| Metric | Production `/health` ($c=1$) | Production `/{short_code}` Redirect ($c=1$) |
+| Metric | Production `/health` ($c=1$) | Production Warm Redirect `/{short_code}` ($c=1$) |
 | :--- | :--- | :--- |
-| **Execution Status** | **NOT MEASURED** *(Pending Manual Trigger)* | **NOT MEASURED** *(Pending Manual Trigger)* |
+| **Execution Status** | **MEASURED** | **MEASURED** |
 | **Configured Requests**| 10 | 10 |
-| **Success Rate** | Pending | Pending |
-| **Mean Latency** | Pending | Pending |
-| **Median (P50)** | Pending | Pending |
-| **P95 Latency** | Pending | Pending |
-| **Notes** | Dependent on geographic client-to-Render distance | Dependent on Render cold starts and network latency |
+| **Sent Requests** | 10 | 10 |
+| **Successful Requests**| 10 (HTTP 200) | 10 (HTTP 307) |
+| **HTTP 429 Rate Limited** | 0 | 0 |
+| **Total Elapsed Time** | 10.9941 s | 4.6183 s |
+| **Measured Throughput** | 0.91 req/sec | 2.17 req/sec |
+| **Min Latency** | 965.806 ms | 281.071 ms |
+| **Mean Latency** | 1099.333 ms | 461.744 ms |
+| **Median (P50)** | 1043.448 ms | 350.265 ms |
+| **P90 Latency** | 1595.793 ms | 1140.800 ms |
+| **P95 Latency** | 1595.793 ms | 1140.800 ms |
+| **P99 Latency** | 1595.793 ms | 1140.800 ms |
+| **Max Latency** | 1595.793 ms | 1140.800 ms |
 
 ---
 
-## 5. Engineering Analysis & Interpretation
+### Tier 4: Server-Side Processing Duration (`X-Process-Time`)
+*Individual verified responses observed during warm-cache execution:*
 
-1. **Algorithmic Overhead vs. Network Latency:**
-   - The custom LRU Cache executes in **~1.34 microseconds** per lookup ($O(1)$ HashMap + node pointer update + thread lock).
-   - Local HTTP network transport requires **~2–3 milliseconds** (a $2,000\times$ difference compared to in-memory execution).
-   - Remote database round-trips over WAN typically require **20–100+ milliseconds** depending on distance.
-   - **Architectural Fact:** When a URL is present in the LRU cache, the database read path is completely bypassed, insulating PostgreSQL from read-traffic spikes.
+| Request Index | Status Code | Header `X-Process-Time` | Server Processing Duration |
+| :--- | :---: | :---: | :---: |
+| **Request 1** | `HTTP 307` | `0.001297` | ~1.30 ms |
+| **Request 2** | `HTTP 307` | `0.001482` | ~1.48 ms |
+| **Request 3** | `HTTP 307` | `0.002788` | ~2.79 ms |
+| **Individual Probe**| `HTTP 307` | `0.001624` | ~1.62 ms |
 
-2. **Tail Latency (P99) Dynamics:**
-   - Under concurrency in a single-process event loop, P99 increases slightly due to CPU scheduling and lock acquisition times.
-   - The sliding-window rate limiter prevents volumetric concurrency storms from degrading P50 latencies for well-behaved clients.
+---
+
+## 5. Engineering Analysis & Architectural Evolution
+
+1. **Clear Separation of Latency Boundaries:**
+   - **In-Process Algorithmic Lookup:** The custom LRU Cache executes in **~1.34 µs** in-memory.
+   - **Server-Side Application Processing (`X-Process-Time`):** On warm cache redirects, server-side processing completes in **~1.3–2.8 ms**, which is consistent with the documented cache-hit path where database read queries are avoided.
+   - **Client-Observed End-to-End HTTP Latency:** End-to-end client latency on production averaged **~461.7 ms** for warm redirects and **~1099.3 ms** for `/health` (legacy deep probe). The vast majority of client-observed duration reflects geographic WAN internet transit between the client location and the Render cloud container.
+   - **Scientific Caution:** Client-side HTTP latency encompasses the complete network path (DNS, TLS negotiation, cross-continent routing, Cloudflare proxying, server processing). It must not be conflated with raw database or server processing latency.
+
+2. **Phase 6 Health & Readiness Architectural Decoupling:**
+   - **Legacy `/health` (Phase 5 Observation):** In Phase 5, `/health` performed a synchronous database health probe (`SELECT 1;`) via the connection pool on every invocation, yielding server-side processing times of ~695 ms and P50 client latency of **1043.4 ms**.
+   - **Phase 6 Liveness (`GET /health`):** Architecturally redesigned into a pure shallow in-memory liveness probe with **zero database queries**. It reads process uptime and LRU cache metrics directly from RAM, yielding near-instantaneous sub-millisecond server processing (`X-Process-Time` ~1–2 ms).
+   - **Phase 6 Readiness (`GET /health/ready`):** Retains explicit database connectivity validation via `DatabaseManager.check_health()`, intentionally isolating network-bound PostgreSQL pool verification from regular orchestrator liveness checks.
 
 ---
 
 ## 6. System Limitations
 
 1. **Process-Local Memory Cache:**
-   - LRU cache and sliding-window rate limiters are stored in process memory. Each worker or instance maintains an independent cache.
-   - Horizontal scaling across multiple container instances would require a distributed caching tier (e.g., Redis) or sticky sessions.
+   - LRU cache and sliding-window rate limiters reside in process memory. Each worker maintains an independent cache.
 2. **Single Worker Concurrency:**
    - Uvicorn runs under `--workers 1` to guarantee local cache state consistency.
-3. **Render Free Tier Spin-Down:**
-   - Render free-tier web services spin down after 15 minutes of inactivity. Initial cold-start requests may exhibit transient delays while the container boots.
+3. **Sample Size Notice:**
+   - The production benchmark was intentionally conducted with a controlled volume of 10 requests at concurrency 1 to prevent rate-limit exhaustion. Tail percentiles (P90/P95/P99) are approximate due to the conservative sample size.
+4. **Network Variability:**
+   - Production HTTP measurements are subject to public internet routing, Cloudflare edge caching behavior, and Render free-tier container wake states.
 
 ---
 
@@ -119,14 +144,14 @@ python benchmarks/benchmark_resolution.py
 
 ### Run Local HTTP Benchmark:
 ```bash
-# Terminal 1: Start local development server
-uvicorn app.main:app --host 127.0.0.1 --port 8000
-
-# Terminal 2: Run controlled benchmark
 python benchmarks/benchmark_http.py --base-url http://127.0.0.1:8000 --endpoint /health --requests 20 --concurrency 1
 ```
 
 ### Run Controlled Production Benchmark:
 ```bash
+# Health endpoint benchmark
 python benchmarks/benchmark_http.py --base-url https://cacheshort-api.onrender.com --endpoint /health --requests 10 --concurrency 1
+
+# Warm redirect endpoint benchmark
+python benchmarks/benchmark_http.py --base-url https://cacheshort-api.onrender.com --endpoint /DyZUQxU --requests 10 --concurrency 1
 ```

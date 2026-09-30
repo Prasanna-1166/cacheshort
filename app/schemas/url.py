@@ -75,12 +75,22 @@ class URLStatsResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    """Application health status response."""
+    """Application shallow liveness health status response."""
 
     status: str = Field(..., description="Overall service health status")
     environment: str = Field(..., description="Current application environment")
     cache_size: int = Field(..., description="Number of entries currently stored in LRU cache")
     cache_capacity: int = Field(..., description="Maximum configured capacity of LRU cache")
-    database: str = Field(..., description="Database connection status")
+    database: Optional[str] = Field(None, description="Database connection status")
     uptime_seconds: float = Field(..., description="Process uptime in seconds since initialization")
+
+
+class ReadinessResponse(BaseModel):
+    """Application deep database readiness probe response."""
+
+    status: str = Field(..., description="Service readiness status (ok or degraded)")
+    environment: str = Field(..., description="Current application environment")
+    database: str = Field(..., description="Database connectivity status (healthy, unreachable, or not_configured)")
+    uptime_seconds: float = Field(..., description="Process uptime in seconds since initialization")
+
 

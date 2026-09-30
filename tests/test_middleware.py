@@ -164,3 +164,65 @@ def test_benchmark_percentile_calculations():
     empty_stats = calculate_percentiles([])
     assert empty_stats["mean_ms"] == 0.0
     assert empty_stats["median_ms"] == 0.0
+
+
+def test_security_headers_present_on_successful_response(client: TestClient):
+    """Verify X-Content-Type-Options and X-Frame-Options on successful responses."""
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.headers.get("X-Content-Type-Options") == "nosniff"
+    assert response.headers.get("X-Frame-Options") == "DENY"
+
+
+def test_security_headers_present_on_error_response(client: TestClient):
+    """Verify security headers are attached even on 404/400 error responses."""
+    response = client.get("/nonexistent-route-xyz")
+    assert response.status_code in (400, 404)
+    assert response.headers.get("X-Content-Type-Options") == "nosniff"
+    assert response.headers.get("X-Frame-Options") == "DENY"
+
+
+def test_security_headers_present_on_protected_endpoints(client: TestClient, obs_environment):
+    """Verify security headers on authenticated endpoint responses."""
+    headers = {API_KEY_HEADER_NAME: obs_environment["raw_key"]}
+    response = client.get("/api/cache/stats", headers=headers)
+    assert response.status_code == 200
+    assert response.headers.get("X-Content-Type-Options") == "nosniff"
+    assert response.headers.get("X-Frame-Options") == "DENY"
+
+
+def test_hsts_header_present_only_on_https(client: TestClient):
+    """Verify Strict-Transport-Security is applied for HTTPS requests and omitted for local HTTP."""
+    # Plain HTTP: no HSTS
+    http_resp = client.get("/health")
+    assert "Strict-Transport-Security" not in http_resp.headers
+
+    # Forwarded HTTPS (proxy/Render termination)
+    https_resp = client.get("/health", headers={"X-Forwarded-Proto": "https"})
+    assert "Strict-Transport-Security" in https_resp.headers
+    assert "max-age=" in https_resp.headers["Strict-Transport-Security"]
+
+
+def test_request_body_size_protection_under_limit(client: TestClient, obs_environment):
+    """Verify requests with body size under 64 KB are permitted."""
+    headers = {API_KEY_HEADER_NAME: obs_environment["raw_key"]}
+    payload = {"url": "https://example.com/small-payload"}
+    response = client.post("/api/urls", json=payload, headers=headers)
+    assert response.status_code == 201
+
+
+def test_request_body_size_protection_over_limit(client: TestClient, obs_environment):
+    """Verify requests with body size exceeding 64 KB (65536 bytes) return 413 Payload Too Large."""
+    headers = {
+        API_KEY_HEADER_NAME: obs_environment["raw_key"],
+        "Content-Type": "application/json",
+    }
+    # Create payload > 64 KB
+    large_payload = '{"url": "https://example.com/' + ("a" * 70000) + '"}'
+    response = client.post("/api/urls", content=large_payload, headers=headers)
+    assert response.status_code == 413
+    data = response.json()
+    assert "detail" in data
+    assert "64 KB" in data["detail"]
+    assert response.headers.get("X-Content-Type-Options") == "nosniff"
+    assert response.headers.get("X-Frame-Options") == "DENY"

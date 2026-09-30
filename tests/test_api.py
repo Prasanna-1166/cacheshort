@@ -65,16 +65,55 @@ def client(clean_environment) -> TestClient:
 
 
 
+from unittest.mock import patch
+from app.database.connection import DatabaseManager
+
+
 def test_health_endpoint(client: TestClient):
-    """Verify /health returns 200 and expected schema keys."""
-    response = client.get("/health")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "ok"
-    assert "cache_size" in data
-    assert "cache_capacity" in data
-    assert "database" in data
-    assert "environment" in data
+    """Verify /health returns 200 and expected schema keys without querying the database."""
+    with patch.object(DatabaseManager, "check_health") as mock_db_health:
+        response = client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert "cache_size" in data
+        assert "cache_capacity" in data
+        assert "uptime_seconds" in data
+        assert data["uptime_seconds"] >= 0.0
+        assert "environment" in data
+        # Crucial: verify check_health was NOT invoked
+        mock_db_health.assert_not_called()
+
+
+def test_health_liveness_remains_successful_when_db_is_down(client: TestClient):
+    """Verify /health remains 200 OK even if database check would fail."""
+    with patch.object(DatabaseManager, "check_health", return_value=False):
+        response = client.get("/health")
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+
+
+def test_readiness_endpoint_healthy(client: TestClient):
+    """Verify /health/ready calls check_health and returns 200 when database is healthy."""
+    with patch.object(DatabaseManager, "check_health", return_value=True) as mock_db_health:
+        response = client.get("/health/ready")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["database"] == "healthy"
+        assert data["uptime_seconds"] >= 0.0
+        mock_db_health.assert_called_once()
+
+
+def test_readiness_endpoint_unhealthy_returns_503(client: TestClient):
+    """Verify /health/ready returns 503 when database health check fails."""
+    with patch.object(DatabaseManager, "check_health", return_value=False) as mock_db_health:
+        response = client.get("/health/ready")
+        assert response.status_code == 503
+        data = response.json()
+        assert data["status"] == "degraded"
+        assert data["database"] == "unavailable"
+        mock_db_health.assert_called_once()
 
 
 def test_cache_stats_endpoint(client: TestClient):

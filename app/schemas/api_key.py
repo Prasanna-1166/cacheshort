@@ -1,8 +1,28 @@
-"""Pydantic schemas for API Key metadata and authentication models."""
-
 from datetime import datetime
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+class APIKeyCreateRequest(BaseModel):
+    """Payload for creating a new named API key."""
+
+    name: str = Field(
+        ...,
+        description="Human-readable label for the API key",
+        examples=["production-service", "ci-cd-pipeline"],
+    )
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        if not v or not isinstance(v, str):
+            raise ValueError("Key name cannot be empty")
+        v = v.strip()
+        if not v:
+            raise ValueError("Key name cannot be empty or only whitespace")
+        if len(v) > 64:
+            raise ValueError("Key name cannot exceed 64 characters")
+        return v
 
 
 class APIKeyInfoResponse(BaseModel):
@@ -25,3 +45,12 @@ class APIKeyCreateResponse(BaseModel):
     key_prefix: str = Field(..., description="Key prefix")
     raw_key: str = Field(..., description="The unhashed API key (displayed only once upon creation)")
     created_at: datetime = Field(..., description="Creation timestamp")
+
+
+class APIKeyRevokeResponse(BaseModel):
+    """Response returned upon revoking an API key."""
+
+    id: int = Field(..., description="Unique key identifier")
+    revoked: bool = Field(..., description="Whether the key was successfully revoked")
+    message: str = Field(..., description="Status message regarding the revocation operation")
+

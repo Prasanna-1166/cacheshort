@@ -9,10 +9,22 @@ An educational, high-performance URL-shortening backend built with FastAPI, Post
 **CacheShort** is designed to demonstrate clean backend architecture, data structure fundamentals, and caching mechanics. In high-throughput URL shortening services, lookups follow the Pareto distribution (80-90% of redirects hit a small subset of hot/viral URLs). Querying the database for every redirect creates unnecessary disk I/O and connection overhead. CacheShort solves this by placing an $O(1)$ custom LRU cache in front of the database.
 
 ### Key Capabilities
-- **Public High-Speed Redirects:** `GET /{short_code}` and `GET /health` remain open, unauthenticated, and ultra-fast.
+- **Public High-Speed Redirects:** `GET /{short_code}` remains open, unauthenticated, and ultra-fast.
 - **Cache-First URL Resolution:** Cache hits resolve directly from memory in ~1.3 microseconds with **zero database read queries**.
+- **Separated Liveness & Readiness Probes:**
+  - `GET /health`: Zero-DB shallow liveness probe reporting in-memory LRU metrics and process uptime.
+  - `GET /health/ready`: Deep readiness probe actively verifying PostgreSQL pool connectivity.
 - **Asynchronous Analytics:** Access counts and timestamps persist to PostgreSQL asynchronously via FastAPI `BackgroundTasks` without stalling redirect responses.
-- **Protected Management Endpoints:** `POST /api/urls`, `GET /api/urls/{short_code}`, `GET /api/urls/{short_code}/stats`, and `GET /api/cache/stats` enforce database-backed SHA-256 API key authentication via `X-API-Key`.
+- **API Key Lifecycle Management:**
+  - `POST /api/keys`: Create cryptographically secure API keys (plaintext returned only once; only SHA-256 hash persisted).
+  - `GET /api/keys`: List safe key metadata without exposing secrets or hashes.
+  - `DELETE /api/keys/{key_id}`: Instant revocation of API keys.
+- **Administrative Cache Controls:**
+  - `DELETE /api/cache/entries/{short_code}`: Remove specific entries from LRU cache memory.
+  - `POST /api/cache/clear`: Invalidate all in-memory entries while preserving cumulative hit/miss statistics.
+- **Production Security & Protection:**
+  - Standardized security headers (`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Strict-Transport-Security` over HTTPS).
+  - Request body size limit (rejects mutating payloads exceeding 64 KB with HTTP 413).
 - **Production Observability:** Machine-readable structured JSON access logs, `X-Request-ID` correlation, `X-Process-Time` duration headers, and dynamic process uptime telemetry.
 
 ---
@@ -23,13 +35,13 @@ An educational, high-performance URL-shortening backend built with FastAPI, Post
 
 ```mermaid
 flowchart TD
-    Client(["HTTP Client"]) --> Timing["Observability Middleware\n(X-Request-ID & X-Process-Time)"]
+    Client(["HTTP Client"]) --> Timing["Observability Middleware\n(X-Request-ID, X-Process-Time, Sec Headers, 64KB Limit)"]
     Timing --> RateLimiter{"Sliding Window\nRate Limiter"}
     RateLimiter -- "Exceeded" --> HTTP429["HTTP 429 Too Many Requests\n(Retry-After Header)"]
     RateLimiter -- "Allowed" --> Auth{"Route Security\nGateway"}
     
-    Auth -- "Public Routes\n(/health, /{short_code})" --> Service["URLService"]
-    Auth -- "Protected Routes\n(/api/urls, /api/cache)" --> APIKeyCheck{"Verify X-API-Key\n(SHA-256 Hash)"}
+    Auth -- "Public Routes\n(/health, /health/ready, /{short_code})" --> Service["URLService / Health Probe"]
+    Auth -- "Protected Routes\n(/api/urls, /api/keys, /api/cache)" --> APIKeyCheck{"Verify X-API-Key\n(SHA-256 Hash)"}
     
     APIKeyCheck -- "Missing / Invalid / Revoked" --> HTTP401["HTTP 401 Unauthorized"]
     APIKeyCheck -- "Valid" --> Service
@@ -74,7 +86,7 @@ sequenceDiagram
     Service-->>API: original_url
     API->>BG: Enqueue record_access(short_code)
     API-->>MW: HTTP 307 Temporary Redirect (Location: original_url)
-    MW-->>Client: HTTP 307 (Headers: X-Request-ID, X-Process-Time)
+    MW-->>Client: HTTP 307 (Headers: X-Request-ID, X-Process-Time, Sec Headers)
     
     critical Asynchronous Analytics Execution
         BG->>DB: UPDATE urls SET access_count = access_count + 1 WHERE short_code = %s
@@ -106,62 +118,42 @@ sequenceDiagram
     Service->>LRU: put(short_code, original_url)
     Service-->>API: original_url
     API-->>MW: HTTP 307 Temporary Redirect
-    MW-->>Client: HTTP 307 (Headers: X-Request-ID, X-Process-Time)
+    MW-->>Client: HTTP 307 (Headers: X-Request-ID, X-Process-Time, Sec Headers)
 ```
 
 ---
 
-## 3. Observability & Telemetry
+## 3. Observability, Resilience & Security
 
-### 1. Response Headers
+### 1. Security Headers & Payload Protection
+- **`X-Content-Type-Options: nosniff`**: Prevents MIME-type sniffing vulnerabilities.
+- **`X-Frame-Options: DENY`**: Mitigates clickjacking attacks.
+- **`Strict-Transport-Security`**: Enforces HTTPS connections in production environments.
+- **64 KB Payload Protection**: Early HTTP 413 rejection for mutating requests (`POST`/`PUT`/`PATCH`/`DELETE`) exceeding 64 KB (65,536 bytes).
+
+### 2. Telemetry Headers & Structured Logging
 - **`X-Request-ID`:** Unique UUID string (or sanitized client trace ID) correlated across logs and error responses.
 - **`X-Process-Time`:** Exact server execution duration in seconds measured using monotonic high-resolution clock (`time.perf_counter()`).
+- **Structured JSON Logging:** Machine-readable JSON log record emitted per request to stdout/stderr with strict redaction of secrets, tokens, and payloads.
 
-### 2. Structured JSON Logging
-Every request emits a machine-readable JSON log record to `stdout`/`stderr`:
-```json
-{
-  "timestamp": "2026-09-30T16:00:00.123456+00:00",
-  "request_id": "8f3b6188-4c91-4e76-8869-7c85a498b824",
-  "method": "GET",
-  "path": "/k9ZaB1x",
-  "status_code": 307,
-  "duration_ms": 1.42,
-  "client_ip": "203.0.113.195"
-}
-```
-> **Security Guarantee:** Request bodies, query parameters, passwords, `DATABASE_URL`, and authentication headers (`X-API-Key`, `Authorization`) are strictly excluded from logs.
-
-### 3. Dynamic Uptime Telemetry
-The `/health` probe dynamically reports process uptime in seconds without hitting the database:
-```json
-{
-  "status": "ok",
-  "environment": "production",
-  "cache_size": 42,
-  "cache_capacity": 1000,
-  "database": "healthy",
-  "uptime_seconds": 3842.15
-}
-```
+### 3. Health & Readiness Separation
+- **`GET /health` (Liveness):** Evaluates process liveliness and in-memory cache capacity with **zero database interaction**.
+- **`GET /health/ready` (Readiness):** Evaluates end-to-end database connectivity by querying PostgreSQL via `DatabaseManager.check_health()`.
 
 ---
 
-## 4. API Authentication Model
+## 4. API Authentication & Key Lifecycle
 
 ### Header Format
 All protected management requests require:
 ```http
 X-API-Key: cs_live_<cryptographically-random-token>
 ```
-*(Note: `Authorization: Bearer` is intentionally not accepted in this phase).*
 
-### Security Principles
-1. **Never Stored in Plaintext:** Only a 64-character SHA-256 hexadecimal hash is stored in the `api_keys` table.
-2. **Displayed Only Once:** Plaintext keys are shown only when generated via the bootstrap CLI and cannot be recovered later.
-3. **No Credential Leaks:** Authentication failures return a uniform `401 Unauthorized` with `{"detail": "Invalid or missing API key"}` to prevent attackers from enumerating valid or revoked keys.
-4. **Timing Attack Protection:** Hash comparisons use Python's `secrets.compare_digest`.
-5. **Key Revocation:** Keys can be deactivated instantly by setting `is_active = FALSE` and `revoked_at = CURRENT_TIMESTAMP`.
+### Key Management Endpoints
+- `POST /api/keys`: Generates a new API key. The plaintext key is returned **exactly once** in the response.
+- `GET /api/keys`: Returns metadata for all keys (ID, name, prefix, active status, creation/last-used timestamps). Hashes and plaintext secrets are never exposed.
+- `DELETE /api/keys/{key_id}`: Sets `is_active = FALSE` and `revoked_at = CURRENT_TIMESTAMP`. Subsequent authentication attempts with revoked keys immediately fail with `HTTP 401`.
 
 ---
 
@@ -189,8 +181,9 @@ d:/python_project/
 │   │   ├── __init__.py
 │   │   └── routes/
 │   │       ├── __init__.py
-│   │       ├── cache.py            # Cache metrics endpoint (Protected)
-│   │       ├── health.py           # Health check & uptime telemetry (Public)
+│   │       ├── api_keys.py         # API key lifecycle endpoints (Protected)
+│   │       ├── cache.py            # Cache stats & invalidation endpoints (Protected)
+│   │       ├── health.py           # Shallow liveness & deep readiness probes (Public)
 │   │       └── urls.py             # URL creation, redirect & analytics endpoints
 │   ├── cache/
 │   │   ├── __init__.py
@@ -199,7 +192,7 @@ d:/python_project/
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── config.py               # Settings & environment configuration
-│   │   ├── middleware.py           # Observability, Request ID & timing middleware
+│   │   ├── middleware.py           # Observability, security headers & body limit middleware
 │   │   ├── rate_limiter.py         # Thread-safe sliding window rate limiter
 │   │   └── security.py             # Key generation, SHA-256 hashing, and verification dependency
 │   ├── database/
@@ -209,9 +202,9 @@ d:/python_project/
 │   │   └── api_key_repository.py   # API key data access repository (Postgres & InMemory)
 │   ├── schemas/
 │   │   ├── __init__.py
-│   │   ├── api_key.py              # Safe API key metadata schemas
-│   │   ├── cache.py                # Cache stats response schema
-│   │   └── url.py                  # Pydantic request/response schemas
+│   │   ├── api_key.py              # API key request & safe metadata schemas
+│   │   ├── cache.py                # Cache stats and invalidation schemas
+│   │   └── url.py                  # URL request/response schemas & health/readiness schemas
 │   └── services/
 │       ├── __init__.py
 │       └── url_service.py          # Business logic, short-code generator, cache manager
@@ -228,11 +221,13 @@ d:/python_project/
 │       └── 20260330000001_create_api_keys_table.sql
 ├── tests/
 │   ├── __init__.py
-│   ├── test_api.py                 # FastAPI endpoint integration tests
+│   ├── test_api.py                 # FastAPI endpoint integration & readiness tests
+│   ├── test_api_key_management.py  # API key lifecycle integration tests
+│   ├── test_cache_invalidation.py  # Cache invalidation & clear integration tests
 │   ├── test_cache_metrics.py       # Cache metrics & thread-safety unit tests
 │   ├── test_database.py            # Database repository & fallback enforcement tests
 │   ├── test_lru_cache.py           # LRU Cache unit & eviction order tests
-│   ├── test_middleware.py          # Observability, timing, logging & uptime tests
+│   ├── test_middleware.py          # Observability, security headers & body limit tests
 │   ├── test_rate_limiter.py        # Sliding window rate limiter unit tests
 │   ├── test_security.py            # API key generation, hashing & authentication tests
 │   ├── test_url_service.py         # URL service, cache-hit & collision logic tests
@@ -253,7 +248,8 @@ d:/python_project/
 
 | Method | Endpoint | Authentication | Rate Limited | Description |
 | :--- | :--- | :---: | :---: | :--- |
-| `GET` | `/health` | **Public** | No | Service health, cache size, DB status, uptime |
+| `GET` | `/health` | **Public** | No | Shallow liveness probe (zero DB queries) |
+| `GET` | `/health/ready` | **Public** | No | Deep readiness probe (PostgreSQL connectivity check) |
 | `GET` | `/{short_code}` | **Public** | Yes | $O(1)$ LRU Cache redirect to original URL |
 | `GET` | `/docs` | **Public** | No | Interactive OpenAPI Swagger UI |
 | `GET` | `/openapi.json` | **Public** | No | OpenAPI 3.0 schema |
@@ -261,14 +257,23 @@ d:/python_project/
 | `GET` | `/api/urls/{short_code}` | **Protected** (`X-API-Key`) | Yes | Retrieve URL metadata |
 | `GET` | `/api/urls/{short_code}/stats` | **Protected** (`X-API-Key`) | Yes | Access analytics & timestamps |
 | `GET` | `/api/cache/stats` | **Protected** (`X-API-Key`) | Yes | Observability stats of LRU cache |
+| `DELETE` | `/api/cache/entries/{short_code}` | **Protected** (`X-API-Key`) | Yes | Invalidate single entry from cache |
+| `POST` | `/api/cache/clear` | **Protected** (`X-API-Key`) | Yes | Invalidate all entries in cache |
+| `POST` | `/api/keys` | **Protected** (`X-API-Key`) | Yes | Generate new API key (returns plaintext once) |
+| `GET` | `/api/keys` | **Protected** (`X-API-Key`) | Yes | List all API key metadata |
+| `DELETE` | `/api/keys/{key_id}` | **Protected** (`X-API-Key`) | Yes | Revoke API key |
 
 ---
 
 ## 8. Usage & Curl Examples
 
-### 1. Health Probe with Uptime (Public)
+### 1. Health & Readiness Probes (Public)
 ```bash
+# Shallow liveness probe (Zero DB calls)
 curl -i https://cacheshort-api.onrender.com/health
+
+# Deep readiness probe (PostgreSQL check)
+curl -i https://cacheshort-api.onrender.com/health/ready
 ```
 
 ### 2. Create Short URL (Protected)
@@ -287,6 +292,34 @@ curl -i https://cacheshort-api.onrender.com/k9ZaB1x
 ### 4. Fetch Analytics (Protected)
 ```bash
 curl -i https://cacheshort-api.onrender.com/api/urls/k9ZaB1x/stats \
+  -H "X-API-Key: cs_live_your_actual_key_here"
+```
+
+### 5. API Key Management (Protected)
+```bash
+# Create a new API key
+curl -i -X POST https://cacheshort-api.onrender.com/api/keys \
+  -H "X-API-Key: cs_live_your_actual_key_here" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "analytics-worker"}'
+
+# List active and revoked API keys
+curl -i https://cacheshort-api.onrender.com/api/keys \
+  -H "X-API-Key: cs_live_your_actual_key_here"
+
+# Revoke an API key
+curl -i -X DELETE https://cacheshort-api.onrender.com/api/keys/2 \
+  -H "X-API-Key: cs_live_your_actual_key_here"
+```
+
+### 6. Cache Invalidation (Protected)
+```bash
+# Invalidate a single short-code from LRU cache
+curl -i -X DELETE https://cacheshort-api.onrender.com/api/cache/entries/k9ZaB1x \
+  -H "X-API-Key: cs_live_your_actual_key_here"
+
+# Clear entire in-memory LRU cache
+curl -i -X POST https://cacheshort-api.onrender.com/api/cache/clear \
   -H "X-API-Key: cs_live_your_actual_key_here"
 ```
 

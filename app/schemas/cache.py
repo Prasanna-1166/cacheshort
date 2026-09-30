@@ -13,3 +13,19 @@ class CacheStatsResponse(BaseModel):
     misses: int = Field(..., description="Number of cache misses")
     evictions: int = Field(..., description="Number of least-recently-used entries evicted")
     hit_rate: float = Field(..., description="Proportion of cache lookups that were hits (0.0 to 1.0)")
+
+
+class CacheEvictionResponse(BaseModel):
+    """Response returned upon administrative cache key eviction."""
+
+    short_code: str = Field(..., description="The short code targeted for eviction")
+    evicted: bool = Field(..., description="Whether the entry was found in memory and evicted")
+    message: str = Field(..., description="Status description of the eviction action")
+
+
+class CacheClearResponse(BaseModel):
+    """Response returned upon administrative cache flush."""
+
+    cleared_entries: int = Field(..., description="Count of cache items evicted during clear operation")
+    message: str = Field(..., description="Status description of the clear action")
+

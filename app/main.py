@@ -7,7 +7,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
-from app.api.routes import health_router, urls_router, cache_router
+from app.api.routes import health_router, urls_router, cache_router, api_keys_router
 from app.core.config import get_settings
 from app.core.middleware import ObservabilityMiddleware
 from app.database.connection import DatabaseManager
@@ -85,5 +85,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 # Include Routers (specific path prefixes first)
 app.include_router(health_router)
 app.include_router(cache_router)
+app.include_router(api_keys_router)
 app.include_router(urls_router)
+
 

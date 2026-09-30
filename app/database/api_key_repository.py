@@ -43,6 +43,16 @@ class BaseAPIKeyRepository(abc.ABC):
         pass
 
     @abc.abstractmethod
+    def get_by_id(self, key_id: int) -> Optional[APIKeyRecord]:
+        """Fetch API key record by its ID."""
+        pass
+
+    @abc.abstractmethod
+    def list_all_keys(self) -> list[APIKeyRecord]:
+        """List all stored API key records."""
+        pass
+
+    @abc.abstractmethod
     def update_last_used(self, key_id: int) -> None:
         """Update last_used_at timestamp for a given key ID."""
         pass
@@ -90,6 +100,32 @@ class PostgresAPIKeyRepository(BaseAPIKeyRepository):
                 if not row:
                     return None
                 return APIKeyRecord(**row)
+
+    def get_by_id(self, key_id: int) -> Optional[APIKeyRecord]:
+        query = """
+            SELECT id, name, key_prefix, key_hash, is_active, created_at, last_used_at, revoked_at
+            FROM api_keys
+            WHERE id = %s;
+        """
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(query, (key_id,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                return APIKeyRecord(**row)
+
+    def list_all_keys(self) -> list[APIKeyRecord]:
+        query = """
+            SELECT id, name, key_prefix, key_hash, is_active, created_at, last_used_at, revoked_at
+            FROM api_keys
+            ORDER BY created_at DESC;
+        """
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(query)
+                rows = cur.fetchall()
+                return [APIKeyRecord(**r) for r in rows]
 
     def update_last_used(self, key_id: int) -> None:
         query = """
@@ -150,6 +186,12 @@ class InMemoryAPIKeyRepository(BaseAPIKeyRepository):
 
     def get_by_hash(self, key_hash: str) -> Optional[APIKeyRecord]:
         return self._records.get(key_hash)
+
+    def get_by_id(self, key_id: int) -> Optional[APIKeyRecord]:
+        return self._by_id.get(key_id)
+
+    def list_all_keys(self) -> list[APIKeyRecord]:
+        return sorted(list(self._by_id.values()), key=lambda k: k.created_at, reverse=True)
 
     def update_last_used(self, key_id: int) -> None:
         record = self._by_id.get(key_id)
