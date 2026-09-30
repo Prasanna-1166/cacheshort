@@ -82,3 +82,5 @@ class HealthResponse(BaseModel):
     cache_size: int = Field(..., description="Number of entries currently stored in LRU cache")
     cache_capacity: int = Field(..., description="Maximum configured capacity of LRU cache")
     database: str = Field(..., description="Database connection status")
+    uptime_seconds: float = Field(..., description="Process uptime in seconds since initialization")
+

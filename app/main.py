@@ -1,13 +1,15 @@
-"""Main FastAPI application entry point for CacheShort."""
-
+import json
 import logging
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import AsyncGenerator
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
 from app.api.routes import health_router, urls_router, cache_router
 from app.core.config import get_settings
+from app.core.middleware import ObservabilityMiddleware
 from app.database.connection import DatabaseManager
 
 logging.basicConfig(
@@ -56,14 +58,27 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Register Observability & Timing Middleware
+app.add_middleware(ObservabilityMiddleware)
+
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Safe production exception handler preventing credential/internal trace leakage."""
-    logger.error("Unhandled server exception on %s %s: %s", request.method, request.url.path, exc)
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+    error_payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "request_id": request_id,
+        "event": "unhandled_server_exception",
+        "method": request.method,
+        "path": request.url.path,
+        "error_type": type(exc).__name__,
+    }
+    logger.error(json.dumps(error_payload))
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": "An internal server error occurred."},
+        headers={"X-Request-ID": request_id},
     )
 
 
@@ -71,3 +86,4 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 app.include_router(health_router)
 app.include_router(cache_router)
 app.include_router(urls_router)
+

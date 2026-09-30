@@ -1,80 +1,171 @@
 # CacheShort — LRU-Cache-Backed URL Shortener
 
-An educational, high-performance URL-shortening backend built with FastAPI, PostgreSQL (hosted on Supabase), and a custom in-memory Least Recently Used (LRU) Cache implemented from scratch using a HashMap + Doubly Linked List with full observability metrics, sliding-window rate limiting, and database-backed hashed API-key authentication.
+An educational, high-performance URL-shortening backend built with FastAPI, PostgreSQL (hosted on Supabase), and a custom in-memory Least Recently Used (LRU) Cache implemented from scratch using a HashMap + Doubly Linked List with full observability metrics, sliding-window rate limiting, database-backed hashed API-key authentication, and request timing telemetry.
 
 ---
 
 ## 1. Project Overview
 
-**CacheShort** is designed to demonstrate clean backend architecture, data structure fundamentals, and caching mechanics. In high-throughput URL shortening services, lookups follow the Pareto distribution (80-90% of redirects hit a small subset of hot/viral URLs). Querying the database for every redirect creates unnecessary disk I/O and connection overhead. CacheShort solves this by placing an $O(1)$ LRU cache in front of the database.
+**CacheShort** is designed to demonstrate clean backend architecture, data structure fundamentals, and caching mechanics. In high-throughput URL shortening services, lookups follow the Pareto distribution (80-90% of redirects hit a small subset of hot/viral URLs). Querying the database for every redirect creates unnecessary disk I/O and connection overhead. CacheShort solves this by placing an $O(1)$ custom LRU cache in front of the database.
 
-In Phase 4, CacheShort incorporates **API-Key Authentication and Security Hardening**:
-- **Public High-Speed Redirects:** `GET /{short_code}` and `GET /health` remain open, ultra-fast, and unauthenticated.
-- **Protected Management Endpoints:** `POST /api/urls`, `GET /api/urls/{short_code}`, `GET /api/urls/{short_code}/stats`, and `GET /api/cache/stats` require valid database-backed API keys via the `X-API-Key` header.
-- **Cryptographic Security:** API keys are formatted as `cs_live_<token>`, hashed using SHA-256 before storage in PostgreSQL, verified in constant time (`secrets.compare_digest`), and supported by active/revocation lifecycle controls.
+### Key Capabilities
+- **Public High-Speed Redirects:** `GET /{short_code}` and `GET /health` remain open, unauthenticated, and ultra-fast.
+- **Cache-First URL Resolution:** Cache hits resolve directly from memory in ~1.3 microseconds with **zero database read queries**.
+- **Asynchronous Analytics:** Access counts and timestamps persist to PostgreSQL asynchronously via FastAPI `BackgroundTasks` without stalling redirect responses.
+- **Protected Management Endpoints:** `POST /api/urls`, `GET /api/urls/{short_code}`, `GET /api/urls/{short_code}/stats`, and `GET /api/cache/stats` enforce database-backed SHA-256 API key authentication via `X-API-Key`.
+- **Production Observability:** Machine-readable structured JSON access logs, `X-Request-ID` correlation, `X-Process-Time` duration headers, and dynamic process uptime telemetry.
 
 ---
 
-## 2. Architecture & Security Model
+## 2. Architecture & Request Lifecycles
 
-```
-Client Request
-      │
-      ▼
-Process-Local Sliding Window Rate Limiter ──[Exceed Limit]──> HTTP 429 + Retry-After
-      │
-      ▼
-Route Security Gateway
-      │
-      ├── Public Routes (GET /{short_code}, GET /health, /docs, /openapi.json)
-      │     └── Directly proceeds to Service Layer
-      │
-      └── Protected Routes (POST /api/urls, GET /api/urls/{code}, /stats, /cache/stats)
-            │
-            ├── Missing / Malformed X-API-Key ───> HTTP 401 Unauthorized
-            │
-            ├── SHA-256 Lookup in Supabase `api_keys`
-            │     │
-            │     ├── Inactive / Revoked / Not Found ──> HTTP 401 Unauthorized
-            │     │
-            │     └── Valid Active Key (Constant-time check)
-            │           │
-            │           └── Update `last_used_at` ──> Proceed to Service Layer
-            ▼
-Application Service Layer (URLService)
-      │
-      ▼
-Custom In-Memory LRU Cache (HashMap + Doubly Linked List + Metrics)
-      │
-      ├── [HIT]  ───> Return cached original URL (O(1) in-memory, ZERO DB round-trips)
-      │
-      └── [MISS] ───> PostgreSQL (Supabase) via Repository Layer
-                         │
-                         ├── [Found] ───> Populate LRU Cache + Return original URL
-                         └── [Not Found] > Return 404
+### Complete System Architecture
+
+```mermaid
+flowchart TD
+    Client(["HTTP Client"]) --> Timing["Observability Middleware\n(X-Request-ID & X-Process-Time)"]
+    Timing --> RateLimiter{"Sliding Window\nRate Limiter"}
+    RateLimiter -- "Exceeded" --> HTTP429["HTTP 429 Too Many Requests\n(Retry-After Header)"]
+    RateLimiter -- "Allowed" --> Auth{"Route Security\nGateway"}
+    
+    Auth -- "Public Routes\n(/health, /{short_code})" --> Service["URLService"]
+    Auth -- "Protected Routes\n(/api/urls, /api/cache)" --> APIKeyCheck{"Verify X-API-Key\n(SHA-256 Hash)"}
+    
+    APIKeyCheck -- "Missing / Invalid / Revoked" --> HTTP401["HTTP 401 Unauthorized"]
+    APIKeyCheck -- "Valid" --> Service
+    
+    Service --> CacheCheck{"Custom LRU Cache\n(HashMap + Doubly Linked List)"}
+    
+    CacheCheck -- "CACHE HIT (O(1))" --> MemHit["Memory Lookup (~1.3 µs)\nZERO DB Reads"]
+    MemHit --> RedirectResp["HTTP 307 Temporary Redirect\n(Location: original_url)"]
+    RedirectResp -.-> BGTask["BackgroundTasks\nAsync DB Analytics Update"]
+    
+    CacheCheck -- "CACHE MISS" --> DBRead[("Supabase PostgreSQL\nTransaction Pooler")]
+    DBRead --> PopCache["Populate LRU Cache"]
+    PopCache --> RedirectResp
+    
+    BGTask --> DBUpdate[("Atomic DB Counter Update\naccess_count = access_count + 1")]
 ```
 
 ---
 
-## 3. API Authentication & Security Rules
+### Cache-Hit Resolution Sequence (Zero Database Reads)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant MW as Observability Middleware
+    participant RL as Rate Limiter
+    participant API as FastAPI Router
+    participant Service as URLService
+    participant LRU as Custom LRU Cache
+    participant BG as BackgroundTasks
+    participant DB as Supabase PostgreSQL
+
+    Client->>MW: GET /{short_code}
+    MW->>RL: Check sliding window limit
+    RL-->>MW: Request allowed
+    MW->>API: Route to redirect_to_url
+    API->>Service: resolve_short_code(short_code)
+    Service->>LRU: get(short_code)
+    Note over LRU: HashMap lookup + Reorder Doubly Linked List (MRU)
+    LRU-->>Service: original_url (CACHE HIT)
+    Service-->>API: original_url
+    API->>BG: Enqueue record_access(short_code)
+    API-->>MW: HTTP 307 Temporary Redirect (Location: original_url)
+    MW-->>Client: HTTP 307 (Headers: X-Request-ID, X-Process-Time)
+    
+    critical Asynchronous Analytics Execution
+        BG->>DB: UPDATE urls SET access_count = access_count + 1 WHERE short_code = %s
+        DB-->>BG: OK
+    end
+```
+
+---
+
+### Cache-Miss Resolution Sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant MW as Observability Middleware
+    participant API as FastAPI Router
+    participant Service as URLService
+    participant LRU as Custom LRU Cache
+    participant DB as Supabase PostgreSQL
+
+    Client->>MW: GET /{short_code}
+    MW->>API: Route to redirect_to_url
+    API->>Service: resolve_short_code(short_code)
+    Service->>LRU: get(short_code)
+    LRU-->>Service: None (CACHE MISS)
+    Service->>DB: SELECT * FROM urls WHERE short_code = %s
+    DB-->>Service: URLRecord(short_code, original_url, ...)
+    Service->>LRU: put(short_code, original_url)
+    Service-->>API: original_url
+    API-->>MW: HTTP 307 Temporary Redirect
+    MW-->>Client: HTTP 307 (Headers: X-Request-ID, X-Process-Time)
+```
+
+---
+
+## 3. Observability & Telemetry
+
+### 1. Response Headers
+- **`X-Request-ID`:** Unique UUID string (or sanitized client trace ID) correlated across logs and error responses.
+- **`X-Process-Time`:** Exact server execution duration in seconds measured using monotonic high-resolution clock (`time.perf_counter()`).
+
+### 2. Structured JSON Logging
+Every request emits a machine-readable JSON log record to `stdout`/`stderr`:
+```json
+{
+  "timestamp": "2026-09-30T16:00:00.123456+00:00",
+  "request_id": "8f3b6188-4c91-4e76-8869-7c85a498b824",
+  "method": "GET",
+  "path": "/k9ZaB1x",
+  "status_code": 307,
+  "duration_ms": 1.42,
+  "client_ip": "203.0.113.195"
+}
+```
+> **Security Guarantee:** Request bodies, query parameters, passwords, `DATABASE_URL`, and authentication headers (`X-API-Key`, `Authorization`) are strictly excluded from logs.
+
+### 3. Dynamic Uptime Telemetry
+The `/health` probe dynamically reports process uptime in seconds without hitting the database:
+```json
+{
+  "status": "ok",
+  "environment": "production",
+  "cache_size": 42,
+  "cache_capacity": 1000,
+  "database": "healthy",
+  "uptime_seconds": 3842.15
+}
+```
+
+---
+
+## 4. API Authentication Model
 
 ### Header Format
-All protected management requests must supply the API key in the custom header:
+All protected management requests require:
 ```http
 X-API-Key: cs_live_<cryptographically-random-token>
 ```
 *(Note: `Authorization: Bearer` is intentionally not accepted in this phase).*
 
-### Security & Lifecycle Principles
+### Security Principles
 1. **Never Stored in Plaintext:** Only a 64-character SHA-256 hexadecimal hash is stored in the `api_keys` table.
-2. **Displayed Only Once:** Plaintext keys are shown only when generated via the bootstrap CLI and can never be retrieved again.
+2. **Displayed Only Once:** Plaintext keys are shown only when generated via the bootstrap CLI and cannot be recovered later.
 3. **No Credential Leaks:** Authentication failures return a uniform `401 Unauthorized` with `{"detail": "Invalid or missing API key"}` to prevent attackers from enumerating valid or revoked keys.
 4. **Timing Attack Protection:** Hash comparisons use Python's `secrets.compare_digest`.
 5. **Key Revocation:** Keys can be deactivated instantly by setting `is_active = FALSE` and `revoked_at = CURRENT_TIMESTAMP`.
 
 ---
 
-## 4. Technology Stack
+## 5. Technology Stack
 
 - **Language:** Python 3.12+
 - **API Framework:** [FastAPI](https://fastapi.tiangolo.com/)
@@ -82,25 +173,24 @@ X-API-Key: cs_live_<cryptographically-random-token>
 - **Data Validation & Settings:** [Pydantic v2](https://docs.pydantic.dev/) / `pydantic-settings`
 - **Database:** PostgreSQL (hosted on [Supabase](https://supabase.com/))
 - **Database Driver & Pool:** `psycopg` (v3) with `psycopg_pool.ConnectionPool` (`prepare_threshold=None`)
-- **Migrations:** Version-controlled SQL scripts compatible with Supabase CLI
 - **Deployment Platform:** [Render](https://render.com/)
-- **Testing:** [pytest](https://docs.pytest.org/), `httpx` (FastAPI TestClient)
+- **Testing & Benchmarking:** [pytest](https://docs.pytest.org/), `httpx`
 
 ---
 
-## 5. Project Structure
+## 6. Project Structure
 
 ```
 d:/python_project/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                     # FastAPI application, lifespan & router registration
+│   ├── main.py                     # FastAPI app, lifespan, middleware & router registration
 │   ├── api/
 │   │   ├── __init__.py
 │   │   └── routes/
 │   │       ├── __init__.py
 │   │       ├── cache.py            # Cache metrics endpoint (Protected)
-│   │       ├── health.py           # Health check endpoint (Public)
+│   │       ├── health.py           # Health check & uptime telemetry (Public)
 │   │       └── urls.py             # URL creation, redirect & analytics endpoints
 │   ├── cache/
 │   │   ├── __init__.py
@@ -109,6 +199,7 @@ d:/python_project/
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── config.py               # Settings & environment configuration
+│   │   ├── middleware.py           # Observability, Request ID & timing middleware
 │   │   ├── rate_limiter.py         # Thread-safe sliding window rate limiter
 │   │   └── security.py             # Key generation, SHA-256 hashing, and verification dependency
 │   ├── database/
@@ -125,8 +216,10 @@ d:/python_project/
 │       ├── __init__.py
 │       └── url_service.py          # Business logic, short-code generator, cache manager
 ├── benchmarks/
-│   ├── benchmark_resolution.py     # Comparative resolution benchmark
-│   └── README.md                   # Benchmark methodology & measured results
+│   ├── benchmark_resolution.py     # In-process microsecond resolution benchmark
+│   ├── benchmark_http.py           # Controlled HTTP load testing & percentile harness
+│   ├── PERFORMANCE_REPORT.md       # Measured performance report across all tiers
+│   └── README.md                   # In-process benchmark documentation
 ├── scripts/
 │   └── create_api_key.py           # Safe CLI tool to generate and store hashed API keys
 ├── supabase/
@@ -139,6 +232,7 @@ d:/python_project/
 │   ├── test_cache_metrics.py       # Cache metrics & thread-safety unit tests
 │   ├── test_database.py            # Database repository & fallback enforcement tests
 │   ├── test_lru_cache.py           # LRU Cache unit & eviction order tests
+│   ├── test_middleware.py          # Observability, timing, logging & uptime tests
 │   ├── test_rate_limiter.py        # Sliding window rate limiter unit tests
 │   ├── test_security.py            # API key generation, hashing & authentication tests
 │   ├── test_url_service.py         # URL service, cache-hit & collision logic tests
@@ -155,91 +249,11 @@ d:/python_project/
 
 ---
 
-## 6. Local Setup & API Key Generation
-
-### 1. Installation
-```bash
-# Create virtual environment
-python -m venv .venv
-source .venv/bin/activate  # Or on Windows: .venv\Scripts\Activate.ps1
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-### 2. Configure Local `.env`
-```bash
-cp .env.example .env
-```
-
-### 3. Generate a Developer / Admin API Key
-Run the developer CLI script to create an initial API key in PostgreSQL:
-```bash
-python scripts/create_api_key.py --name "local-dev-key"
-```
-Output:
-```text
-============================================================
-SUCCESS: NEW CACHESHORT API KEY GENERATED
-============================================================
-Key ID:     1
-Key Name:   local-dev-key
-Key Prefix: cs_live_abc12
-Created At: 2026-09-30T16:00:00+00:00
-------------------------------------------------------------
-RAW API KEY (Save this now!):
-
-    cs_live_vY8z9k...<random-token>
-
-------------------------------------------------------------
-WARNING: This raw key is shown ONLY ONCE and cannot be recovered.
-Only its cryptographic SHA-256 hash has been stored in PostgreSQL.
-Include this header in API requests:
-    X-API-Key: cs_live_vY8z9k...<random-token>
-============================================================
-```
-
----
-
-## 7. Supabase Database Migrations
-
-Apply both migrations in the Supabase SQL Editor:
-
-### Migration 1: URLs Table
-File: [supabase/migrations/20260330000000_create_urls_table.sql](file:///d:/python_project/supabase/migrations/20260330000000_create_urls_table.sql)
-```sql
-CREATE TABLE IF NOT EXISTS urls (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    short_code VARCHAR(16) NOT NULL UNIQUE,
-    original_url TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_accessed_at TIMESTAMPTZ,
-    access_count BIGINT NOT NULL DEFAULT 0
-);
-```
-
-### Migration 2: API Keys Table
-File: [supabase/migrations/20260330000001_create_api_keys_table.sql](file:///d:/python_project/supabase/migrations/20260330000001_create_api_keys_table.sql)
-```sql
-CREATE TABLE IF NOT EXISTS api_keys (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    name VARCHAR(64) NOT NULL,
-    key_prefix VARCHAR(16) NOT NULL,
-    key_hash VARCHAR(64) NOT NULL UNIQUE,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_used_at TIMESTAMPTZ,
-    revoked_at TIMESTAMPTZ
-);
-```
-
----
-
-## 8. API Endpoints Reference
+## 7. API Endpoints Reference
 
 | Method | Endpoint | Authentication | Rate Limited | Description |
 | :--- | :--- | :---: | :---: | :--- |
-| `GET` | `/health` | **Public** | No | Service health, cache size, DB status |
+| `GET` | `/health` | **Public** | No | Service health, cache size, DB status, uptime |
 | `GET` | `/{short_code}` | **Public** | Yes | $O(1)$ LRU Cache redirect to original URL |
 | `GET` | `/docs` | **Public** | No | Interactive OpenAPI Swagger UI |
 | `GET` | `/openapi.json` | **Public** | No | OpenAPI 3.0 schema |
@@ -250,9 +264,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
 
 ---
 
-## 9. Usage & Curl Examples
+## 8. Usage & Curl Examples
 
-### 1. Health Probe (Public)
+### 1. Health Probe with Uptime (Public)
 ```bash
 curl -i https://cacheshort-api.onrender.com/health
 ```
@@ -264,23 +278,10 @@ curl -i -X POST https://cacheshort-api.onrender.com/api/urls \
   -H "Content-Type: application/json" \
   -d '{"url": "https://fastapi.tiangolo.com/"}'
 ```
-Response (`201 Created`):
-```json
-{
-  "short_code": "k9ZaB1x",
-  "short_url": "https://cacheshort-api.onrender.com/k9ZaB1x",
-  "original_url": "https://fastapi.tiangolo.com/"
-}
-```
 
 ### 3. Public Redirect (No Key Required)
 ```bash
 curl -i https://cacheshort-api.onrender.com/k9ZaB1x
-```
-Response (`307 Temporary Redirect`):
-```http
-HTTP/1.1 307 Temporary Redirect
-Location: https://fastapi.tiangolo.com/
 ```
 
 ### 4. Fetch Analytics (Protected)
@@ -289,26 +290,27 @@ curl -i https://cacheshort-api.onrender.com/api/urls/k9ZaB1x/stats \
   -H "X-API-Key: cs_live_your_actual_key_here"
 ```
 
-### 5. Fetch LRU Cache Observability Stats (Protected)
-```bash
-curl -i https://cacheshort-api.onrender.com/api/cache/stats \
-  -H "X-API-Key: cs_live_your_actual_key_here"
-```
-
-### 6. Key Revocation (Database SQL)
-To revoke an API key, update the record in Supabase:
-```sql
-UPDATE api_keys
-SET is_active = FALSE,
-    revoked_at = CURRENT_TIMESTAMP
-WHERE key_prefix = 'cs_live_abc12';
-```
-
 ---
 
-## 10. Running Test Suite
+## 9. Running Tests & Benchmarks
 
+### 1. Run Automated Test Suite
 ```bash
 pytest -v
 ```
-All 70+ automated tests validate cache mechanics, rate limiting, collision resolution, security rules, hashing, invalid key rejection, and endpoints.
+
+### 2. Run In-Process Micro-Benchmark
+```bash
+python benchmarks/benchmark_resolution.py
+```
+
+### 3. Run Controlled HTTP Load Benchmark
+```bash
+# Benchmark local server
+python benchmarks/benchmark_http.py --base-url http://127.0.0.1:8000 --endpoint /health --requests 20 --concurrency 1
+
+# Controlled production benchmark
+python benchmarks/benchmark_http.py --base-url https://cacheshort-api.onrender.com --endpoint /health --requests 10 --concurrency 1
+```
+
+For complete empirical benchmarks and methodology, refer to [`benchmarks/PERFORMANCE_REPORT.md`](file:///d:/python_project/benchmarks/PERFORMANCE_REPORT.md).
