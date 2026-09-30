@@ -58,3 +58,27 @@ def test_database_manager_health_check_returns_false_when_uninitialized():
     """Verify DatabaseManager.check_health() returns False cleanly without crashing when pool is None."""
     DatabaseManager.close_pool()
     assert DatabaseManager.check_health() is False
+
+
+def test_database_pool_disables_prepared_statements(monkeypatch):
+    """Verify DatabaseManager.initialize_pool passes prepare_threshold=None for transaction poolers."""
+    DatabaseManager.close_pool()
+
+    captured_kwargs = {}
+
+    class MockPool:
+        def __init__(self, conninfo, **kwargs):
+            self.conninfo = conninfo
+            self.kwargs = kwargs
+            self.closed = False
+            captured_kwargs.update(kwargs)
+
+    monkeypatch.setattr("app.database.connection.ConnectionPool", MockPool)
+
+    pool = DatabaseManager.initialize_pool("postgresql://postgres:pass@localhost:5432/postgres")
+    assert pool is not None
+    assert "kwargs" in captured_kwargs
+    assert captured_kwargs["kwargs"] == {"prepare_threshold": None}
+
+    DatabaseManager.close_pool()
+

@@ -25,13 +25,14 @@ class DatabaseManager:
             return None
 
         try:
-            # Psycopg 3 connection pool
+            # Psycopg 3 connection pool configured for Supabase Transaction Pooler (disables prepared statements)
             cls._pool = ConnectionPool(
                 conninfo=db_url,
                 min_size=1,
                 max_size=10,
                 open=True,
                 timeout=10.0,
+                kwargs={"prepare_threshold": None},
             )
             logger.info("PostgreSQL connection pool initialized successfully.")
             return cls._pool
