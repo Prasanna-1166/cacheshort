@@ -5,6 +5,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse
 
 from app.core.rate_limiter import rate_limit_dependency
+from app.core.security import verify_api_key
 from app.schemas.url import (
     URLCreateRequest,
     URLCreateResponse,
@@ -23,7 +24,7 @@ SHORT_CODE_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,16}$")
     "/api/urls",
     response_model=URLCreateResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(rate_limit_dependency)],
+    dependencies=[Depends(verify_api_key), Depends(rate_limit_dependency)],
     summary="Create Short URL",
     description="Generate a new short code for a given target URL, persist it, and add to LRU cache.",
 )
@@ -49,7 +50,7 @@ def create_short_url(
 @router.get(
     "/api/urls/{short_code}/stats",
     response_model=URLStatsResponse,
-    dependencies=[Depends(rate_limit_dependency)],
+    dependencies=[Depends(verify_api_key), Depends(rate_limit_dependency)],
     summary="Get Short URL Analytics",
     description="Fetch access statistics and creation timestamps for a given short code.",
 )
@@ -82,7 +83,7 @@ def get_short_url_stats(
 @router.get(
     "/api/urls/{short_code}",
     response_model=URLInfoResponse,
-    dependencies=[Depends(rate_limit_dependency)],
+    dependencies=[Depends(verify_api_key), Depends(rate_limit_dependency)],
     summary="Get Short URL Details",
     description="Fetch metadata for a given short code.",
 )

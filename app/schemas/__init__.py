@@ -7,6 +7,7 @@ from app.schemas.url import (
     HealthResponse,
 )
 from app.schemas.cache import CacheStatsResponse
+from app.schemas.api_key import APIKeyInfoResponse, APIKeyCreateResponse
 
 __all__ = [
     "URLCreateRequest",
@@ -15,4 +16,7 @@ __all__ = [
     "URLStatsResponse",
     "HealthResponse",
     "CacheStatsResponse",
+    "APIKeyInfoResponse",
+    "APIKeyCreateResponse",
 ]
+

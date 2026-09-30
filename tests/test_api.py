@@ -6,6 +6,8 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.core.config import Settings, get_settings
 from app.database.repository import InMemoryURLRepository, get_repository
+from app.database.api_key_repository import InMemoryAPIKeyRepository, get_api_key_repository
+from app.core.security import generate_api_key, API_KEY_HEADER_NAME
 from app.cache.lru_cache import LRUCache
 from app.core.rate_limiter import SlidingWindowRateLimiter, get_rate_limiter
 from app.services.url_service import get_global_cache, URLService, get_url_service
@@ -15,11 +17,19 @@ from app.services.url_service import get_global_cache, URLService, get_url_servi
 def clean_environment():
     """Ensure clean repository, cache, and rate limiter state for each API test."""
     test_repo = InMemoryURLRepository()
+    test_key_repo = InMemoryAPIKeyRepository()
     test_cache = LRUCache(capacity=10)
     test_limiter = SlidingWindowRateLimiter(requests=50, window_seconds=60)
 
+    # Pre-populate valid test API key
+    raw_key, prefix, key_hash = generate_api_key()
+    test_key_repo.create_api_key(name="test-key", key_prefix=prefix, key_hash=key_hash)
+
     def override_get_repository():
         return test_repo
+
+    def override_get_api_key_repository():
+        return test_key_repo
 
     def override_get_global_cache():
         return test_cache
@@ -31,12 +41,15 @@ def clean_environment():
         return URLService(repository=test_repo, cache=test_cache, base_url="http://testserver")
 
     app.dependency_overrides[get_repository] = override_get_repository
+    app.dependency_overrides[get_api_key_repository] = override_get_api_key_repository
     app.dependency_overrides[get_global_cache] = override_get_global_cache
     app.dependency_overrides[get_rate_limiter] = override_get_rate_limiter
     app.dependency_overrides[get_url_service] = override_get_url_service
 
     yield {
         "repo": test_repo,
+        "key_repo": test_key_repo,
+        "raw_key": raw_key,
         "cache": test_cache,
         "limiter": test_limiter,
     }
@@ -45,8 +58,11 @@ def clean_environment():
 
 
 @pytest.fixture
-def client() -> TestClient:
-    return TestClient(app)
+def client(clean_environment) -> TestClient:
+    c = TestClient(app)
+    c.headers.update({API_KEY_HEADER_NAME: clean_environment["raw_key"]})
+    return c
+
 
 
 def test_health_endpoint(client: TestClient):

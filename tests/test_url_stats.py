@@ -5,6 +5,8 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.database.repository import InMemoryURLRepository, get_repository
+from app.database.api_key_repository import InMemoryAPIKeyRepository, get_api_key_repository
+from app.core.security import generate_api_key, API_KEY_HEADER_NAME
 from app.cache.lru_cache import LRUCache
 from app.services.url_service import get_global_cache, URLService, get_url_service
 
@@ -12,10 +14,18 @@ from app.services.url_service import get_global_cache, URLService, get_url_servi
 @pytest.fixture
 def test_env():
     test_repo = InMemoryURLRepository()
+    test_key_repo = InMemoryAPIKeyRepository()
     test_cache = LRUCache(capacity=10)
+
+    # Pre-populate valid test API key
+    raw_key, prefix, key_hash = generate_api_key()
+    test_key_repo.create_api_key(name="stats-test-key", key_prefix=prefix, key_hash=key_hash)
 
     def override_get_repository():
         return test_repo
+
+    def override_get_api_key_repository():
+        return test_key_repo
 
     def override_get_global_cache():
         return test_cache
@@ -24,17 +34,21 @@ def test_env():
         return URLService(repository=test_repo, cache=test_cache, base_url="http://testserver")
 
     app.dependency_overrides[get_repository] = override_get_repository
+    app.dependency_overrides[get_api_key_repository] = override_get_api_key_repository
     app.dependency_overrides[get_global_cache] = override_get_global_cache
     app.dependency_overrides[get_url_service] = override_get_url_service
 
-    yield {"repo": test_repo, "cache": test_cache}
+    yield {"repo": test_repo, "key_repo": test_key_repo, "raw_key": raw_key, "cache": test_cache}
 
     app.dependency_overrides.clear()
 
 
 @pytest.fixture
 def client(test_env) -> TestClient:
-    return TestClient(app)
+    c = TestClient(app)
+    c.headers.update({API_KEY_HEADER_NAME: test_env["raw_key"]})
+    return c
+
 
 
 def test_get_url_stats_success(client: TestClient):
