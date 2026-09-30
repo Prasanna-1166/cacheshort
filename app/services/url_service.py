@@ -85,29 +85,37 @@ class URLService:
         """Resolve a short code to its original URL using cache-first strategy.
 
         1. Check custom LRU cache (O(1) memory lookup).
-        2. If Cache HIT: Return cached original URL immediately with NO database round-trip (no query, no update).
+        2. If Cache HIT: Return cached original URL immediately with NO database READ.
         3. If Cache MISS: Query PostgreSQL database repository.
-        4. If found in database: Populate LRU cache, update access metadata, and return original URL.
+        4. If found in database: Populate LRU cache and return original URL.
         5. If not found in database: Return None.
         """
-        # Step 1: LRU Cache Lookup
+        # Step 1: LRU Cache Lookup (O(1))
         cached_url = self.cache.get(short_code)
         if cached_url is not None:
-            logger.debug("Cache HIT for short_code '%s' — returning from LRU with zero DB queries/updates", short_code)
+            logger.debug("Cache HIT for short_code '%s' — zero database READs", short_code)
             return cached_url
 
         logger.debug("Cache MISS for short_code '%s' — querying database repository", short_code)
 
-        # Step 2: Database Repository Lookup
+        # Step 2: Database Repository Lookup (Only executed on cache miss)
         record = self.repository.get_by_short_code(short_code)
         if record is None:
             return None
 
-        # Step 3: Populate LRU Cache and update access statistics in database
+        # Step 3: Populate LRU Cache with result
         self.cache.put(short_code, record.original_url)
-        self.repository.increment_access(short_code)
-
         return record.original_url
+
+    def record_access(self, short_code: str) -> None:
+        """Atomically record access metadata in persistent storage.
+
+        Executed safely in the background so redirect performance is unaffected.
+        """
+        try:
+            self.repository.increment_access(short_code)
+        except Exception as e:
+            logger.warning("Failed to record access metadata for short_code '%s': %s", short_code, e)
 
     def get_url_details(self, short_code: str) -> Optional[URLRecord]:
         """Fetch full database record for short code."""

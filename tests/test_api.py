@@ -1,9 +1,10 @@
-"""Integration tests for FastAPI endpoints."""
+"""Integration tests for FastAPI endpoints and production configuration."""
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.core.config import Settings, get_settings
 from app.database.repository import InMemoryURLRepository, get_repository
 from app.cache.lru_cache import LRUCache
 from app.core.rate_limiter import SlidingWindowRateLimiter, get_rate_limiter
@@ -87,6 +88,44 @@ def test_create_short_url_api_success(client: TestClient):
     assert data["short_url"] == f"http://testserver/{data['short_code']}"
 
 
+def test_create_short_url_with_production_base_url(client: TestClient):
+    """Verify POST /api/urls formats short_url using production base_url."""
+    test_repo = InMemoryURLRepository()
+    test_cache = LRUCache(capacity=10)
+    prod_service = URLService(
+        repository=test_repo,
+        cache=test_cache,
+        base_url="https://cacheshort-api.onrender.com",
+    )
+    app.dependency_overrides[get_url_service] = lambda: prod_service
+
+    response = client.post("/api/urls", json={"url": "https://example.com/target"})
+    assert response.status_code == 201
+    data = response.json()
+    assert data["short_url"].startswith("https://cacheshort-api.onrender.com/")
+
+
+def test_production_settings_rejects_localhost():
+    """Verify Settings raises ValueError if base_url is localhost in production mode."""
+    with pytest.raises(ValueError, match="cannot be localhost"):
+        Settings(
+            app_env="production",
+            database_url="postgresql://user:pass@host:5432/db",
+            base_url="http://localhost:8000",
+        ).validate_production_settings()
+
+
+def test_production_settings_accepts_valid_domain():
+    """Verify Settings succeeds when production environment is properly configured."""
+    settings = Settings(
+        app_env="production",
+        database_url="postgresql://user:pass@host:5432/db",
+        base_url="https://cacheshort-api.onrender.com",
+    )
+    # Should not raise
+    settings.validate_production_settings()
+
+
 def test_create_short_url_api_invalid_url(client: TestClient):
     """Verify POST /api/urls rejects invalid URL inputs with 422."""
     response = client.post("/api/urls", json={"url": "not-a-valid-url"})
@@ -138,7 +177,6 @@ def test_get_url_details_api(client: TestClient):
 
 def test_api_rate_limiting_exceeded(client: TestClient):
     """Verify rate limiter blocks client with 429 and Retry-After header when threshold reached."""
-    # Override with a low rate limit for testing
     strict_limiter = SlidingWindowRateLimiter(requests=2, window_seconds=10)
     app.dependency_overrides[get_rate_limiter] = lambda: strict_limiter
 

@@ -54,8 +54,21 @@ class Settings(BaseSettings):
             raise ValueError("base_url must start with http:// or https://")
         return v
 
+    def validate_production_settings(self) -> None:
+        """Validate production configuration requirements."""
+        if self.app_env.lower() in ("production", "prod"):
+            if not self.database_url:
+                raise ValueError("DATABASE_URL is required when running in production mode")
+            if "localhost" in self.base_url.lower() or "127.0.0.1" in self.base_url:
+                raise ValueError(
+                    "In production mode, BASE_URL must be configured to the production domain "
+                    "(e.g. https://cacheshort-api.onrender.com) and cannot be localhost."
+                )
+
 
 @lru_cache()
 def get_settings() -> Settings:
     """Return a cached instance of application settings."""
-    return Settings()
+    settings = Settings()
+    settings.validate_production_settings()
+    return settings

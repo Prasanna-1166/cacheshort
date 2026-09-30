@@ -41,41 +41,52 @@ def test_create_short_url_success(service: URLService, lru_cache: LRUCache, memo
     assert lru_cache.get(result["short_code"]) == target
 
 
-def test_resolve_short_code_cache_hit_zero_database_calls(service: URLService, lru_cache: LRUCache, memory_repo: InMemoryURLRepository):
-    """Verify resolving a short code hits cache with ZERO database roundtrips (no query, no update)."""
+def test_resolve_short_code_cache_hit_zero_database_reads(service: URLService, lru_cache: LRUCache, memory_repo: InMemoryURLRepository):
+    """Verify resolving a short code hits cache with ZERO database READs."""
     # Seed cache directly
     lru_cache.put("mycode", "https://cached-target.com")
 
-    # Mock repository methods to strictly ensure NONE are called on cache hit
+    # Mock repository get method to ensure no database READ occurs on cache hit
     memory_repo.get_by_short_code = MagicMock(return_value=None)
-    memory_repo.increment_access = MagicMock()
 
     resolved = service.resolve_short_code("mycode")
     assert resolved == "https://cached-target.com"
 
-    # Strict assertion: ZERO database calls on cache hit
+    # Strict assertion: ZERO database READs on cache hit
     memory_repo.get_by_short_code.assert_not_called()
-    memory_repo.increment_access.assert_not_called()
+
+
+def test_record_access_updates_analytics(service: URLService, memory_repo: InMemoryURLRepository):
+    """Verify record_access increments access_count and sets last_accessed_at."""
+    record = memory_repo.create_url("code_analytics", "https://example.com/analytics")
+    assert record.access_count == 0
+    assert record.last_accessed_at is None
+
+    # Record first access
+    service.record_access("code_analytics")
+    updated = memory_repo.get_by_short_code("code_analytics")
+    assert updated.access_count == 1
+    assert updated.last_accessed_at is not None
+
+    # Record second access
+    service.record_access("code_analytics")
+    updated2 = memory_repo.get_by_short_code("code_analytics")
+    assert updated2.access_count == 2
 
 
 def test_resolve_short_code_cache_miss_db_hit(service: URLService, lru_cache: LRUCache, memory_repo: InMemoryURLRepository):
-    """Verify cache miss queries the database, populates cache, and increments access count."""
+    """Verify cache miss queries the database and populates cache."""
     # Persist in repo directly without putting in cache
     record = memory_repo.create_url("dbcode", "https://database-target.com")
 
     assert lru_cache.get("dbcode") is None
 
-    # First resolve: cache miss -> database lookup -> populate cache & update access
+    # First resolve: cache miss -> database lookup -> populate cache
     resolved = service.resolve_short_code("dbcode")
     assert resolved == "https://database-target.com"
 
     # Now cache should have it
     assert lru_cache.get("dbcode") == "https://database-target.com"
-
-    # Repository access count incremented on DB hit
-    updated_record = memory_repo.get_by_short_code("dbcode")
-    assert updated_record is not None
-    assert updated_record.access_count == 1
 
 
 def test_resolve_short_code_not_found(service: URLService, lru_cache: LRUCache):

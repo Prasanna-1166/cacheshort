@@ -1,4 +1,4 @@
-"""Unit and API tests for URL Analytics statistics endpoint."""
+"""Unit and API tests for URL Analytics statistics endpoint and access recording."""
 
 import pytest
 from fastapi.testclient import TestClient
@@ -52,7 +52,40 @@ def test_get_url_stats_success(client: TestClient):
     assert data["original_url"] == target
     assert "created_at" in data
     assert "last_accessed_at" in data
-    assert data["access_count"] >= 0
+    assert data["access_count"] == 0
+    assert data["last_accessed_at"] is None
+
+
+def test_redirect_records_persistent_analytics(client: TestClient):
+    """Verify successful redirects update access_count and last_accessed_at."""
+    target = "https://example.com/redirect-analytics"
+    create_resp = client.post("/api/urls", json={"url": target})
+    assert create_resp.status_code == 201
+    short_code = create_resp.json()["short_code"]
+
+    # Before redirect: access_count = 0, last_accessed_at = None
+    initial_stats = client.get(f"/api/urls/{short_code}/stats").json()
+    assert initial_stats["access_count"] == 0
+    assert initial_stats["last_accessed_at"] is None
+
+    # Redirect 1
+    r1 = client.get(f"/{short_code}", follow_redirects=False)
+    assert r1.status_code == 307
+    stats1 = client.get(f"/api/urls/{short_code}/stats").json()
+    assert stats1["access_count"] == 1
+    assert stats1["last_accessed_at"] is not None
+
+    # Redirect 2 (Cache Hit)
+    r2 = client.get(f"/{short_code}", follow_redirects=False)
+    assert r2.status_code == 307
+    stats2 = client.get(f"/api/urls/{short_code}/stats").json()
+    assert stats2["access_count"] == 2
+
+    # Redirect 3 (Cache Hit)
+    r3 = client.get(f"/{short_code}", follow_redirects=False)
+    assert r3.status_code == 307
+    stats3 = client.get(f"/api/urls/{short_code}/stats").json()
+    assert stats3["access_count"] == 3
 
 
 def test_get_url_stats_not_found(client: TestClient):

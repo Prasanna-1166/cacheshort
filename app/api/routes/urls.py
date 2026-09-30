@@ -1,7 +1,7 @@
 """URL shortening, redirection, and analytics endpoints."""
 
 import re
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse
 
 from app.core.rate_limiter import rate_limit_dependency
@@ -129,6 +129,7 @@ def get_short_url_info(
 )
 def redirect_to_url(
     short_code: str,
+    background_tasks: BackgroundTasks,
     url_service: URLService = Depends(get_url_service),
 ) -> RedirectResponse:
     if not SHORT_CODE_PATTERN.match(short_code):
@@ -143,6 +144,9 @@ def redirect_to_url(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Short code not found",
         )
+
+    # Record persistent analytics in background without blocking fast cache-hit redirect
+    background_tasks.add_task(url_service.record_access, short_code)
 
     return RedirectResponse(
         url=original_url,
